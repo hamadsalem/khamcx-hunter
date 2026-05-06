@@ -25,11 +25,12 @@ jobs:
         run: |
           pip install aiohttp
 
-      - name: Run hunter
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: timeout 90 python discovery.py || true
+      - - name: Run hunter
+  env:
+    TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+    TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    BIRDEYE_API_KEY: ${{ secrets.BIRDEYE_API_KEY }}
+  run: timeout 90 python discovery.py || true
 
       - name: Commit signals
         run: |
