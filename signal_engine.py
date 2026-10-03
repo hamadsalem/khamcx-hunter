@@ -33,12 +33,16 @@ def _i(v, default=0) -> int:
 
 def extract_metrics(overview: dict) -> dict:
     """
-    Normalize Birdeye token_overview into our internal metric dict.
+    Normalize free-DEX overview (DexScreener / GeckoTerminal mapped shape)
+    into our internal metric dict.
 
-    Field names per Birdeye: liquidity, mc, fdv, price, priceChange*Percent,
-    v5m, v1h, v24h, trade5m, trade1h, buy5m, sell5m.
+    Expected keys: liquidity, mc, fdv, price, priceChange*Percent,
+    v5m, v1h, v24h, trade5m, trade1h, buy5m, sell5m, createTime.
     """
     m = {}
+    m["name"] = overview.get("name") or ""
+    m["symbol"] = overview.get("symbol") or ""
+    m["url"] = overview.get("url")
     m["price"] = _f(overview.get("price"))
     m["liquidity_usd"] = _f(overview.get("liquidity"))
     m["mcap_usd"] = _f(overview.get("mc") or overview.get("realMc") or overview.get("fdv"))

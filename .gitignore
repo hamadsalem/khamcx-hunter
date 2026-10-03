@@ -1,0 +1,12 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+momentum_bot.db
+momentum_bot.log
+*.db
+*.log
+.DS_Store

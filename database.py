@@ -2,8 +2,8 @@
 SQLite persistence for Phase 1.
 
 Tables:
-- discovered: every token that came from WebSocket NEW_LISTING
-- watches: tokens that passed REST validation and got a WATCH alert
+- discovered: every token that came from free-DEX new-pool discovery
+- watches: tokens that passed snapshot validation and got a WATCH alert
 - watches.telegram_message_id is saved so Phase 2 can reply to the WATCH with ENTRY
 """
 
