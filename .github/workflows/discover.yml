@@ -41,13 +41,13 @@ jobs:
 
       - name: Run discovery (polling mode, 4 minutes)
         env:
-          BIRDEYE_API_KEY: ${{ secrets.BIRDEYE_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_DURATION_SECONDS: '240'
-          POLL_MODE: 'true'
+          POLL_INTERVAL_SEC: '30'
+          TELEGRAM_STARTUP_PING: 'false'
         run: |
-          python main.py || true
+          python main.py
 
       - name: Upload logs as artifact
         if: always()

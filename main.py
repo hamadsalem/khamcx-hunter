@@ -1,21 +1,18 @@
 """
-Solana Momentum Bot - Phase 1 MVP.
+Solana Momentum Bot - Phase 1 MVP (free DEX).
 
 Pipeline:
-  1. WebSocket subscribes to TOKEN_NEW_LISTING with min_liquidity=8000 filter
-  2. On each TOKEN_NEW_LISTING_DATA event:
+  1. Poll GeckoTerminal new_pools (Solana) every POLL_INTERVAL_SEC
+  2. On each new listing:
      a. Save to discovered table
-     b. Wait 60-90s for token to develop some history
-     c. Call REST token_overview to get full snapshot
+     b. Wait VALIDATION_DELAY_SEC
+     c. Fetch DexScreener (fallback GeckoTerminal) snapshot
      d. Apply filters + score
      e. If WATCH passes, send Telegram and save to watches table
   3. Background task expires watches older than WATCH_TTL_MINUTES
-
-Phase 2 will add:
-  - SUBSCRIBE_TXS for tokens in active_watches
-  - Rolling 5m metrics from TXS stream
-  - ENTRY confirmation as Telegram reply_to_message_id
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -25,14 +22,10 @@ from typing import Optional
 import aiohttp
 
 import config
-from birdeye_client import (
-    BirdeyeREST,
-    BirdeyeWebSocket,
-    build_new_listing_subscription,
-)
 from database import Database
+from dex_client import DexClient, NewListing
 from signal_engine import extract_metrics, apply_filters
-from telegram_notifier import send_watch
+from telegram_notifier import verify_telegram, send_startup_ping, send_watch
 
 
 # ==================== Logging ====================
@@ -48,86 +41,103 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
-# ==================== Config tunables ====================
-# How long to wait after first listing before fetching token_overview.
-# Too short = token has no 5m/30m history yet. Too long = miss the move.
-VALIDATION_DELAY_SEC = 90
-
-
 class Pipeline:
-    def __init__(self, db: Database, rest: BirdeyeREST, session: aiohttp.ClientSession):
+    def __init__(self, db: Database, dex: DexClient, session: aiohttp.ClientSession):
         self.db = db
-        self.rest = rest
+        self.dex = dex
         self.session = session
+        # token -> pool_address for validation fallback
+        self._pools: dict[str, str] = {}
 
-    async def handle_new_listing(self, event_type: str, payload: dict):
-        """Called by BirdeyeWebSocket on every event."""
-        if event_type != "TOKEN_NEW_LISTING_DATA":
-            log.debug("Ignored event type: %s", event_type)
-            return
-
-        token = payload.get("address")
+    async def handle_listing(self, listing: NewListing):
+        token = listing.token
         if not token:
-            log.warning("New listing event missing address")
+            return
+        if self.db.is_discovered(token):
             return
 
-        if self.db.is_discovered(token):
-            return  # Already processed
-
-        name = payload.get("name", "")
-        symbol = payload.get("symbol", "")
-        try:
-            liquidity = float(payload.get("liquidity") or 0)
-        except (TypeError, ValueError):
-            liquidity = 0.0
-
-        self.db.add_discovered(token, name, symbol, liquidity, payload)
-        log.info("DISCOVERED %s (%s) liq=$%.0f", symbol or token[:8], name[:20], liquidity)
-
-        # Don't block the WebSocket reader - schedule validation as a separate task
+        self._pools[token] = listing.pool_address
+        self.db.add_discovered(
+            token, listing.name, listing.symbol, listing.liquidity, listing.raw
+        )
+        log.info(
+            "DISCOVERED %s (%s) liq=$%.0f dex=%s",
+            listing.symbol or token[:8],
+            (listing.name or "")[:24],
+            listing.liquidity,
+            listing.dex_id,
+        )
         asyncio.create_task(self._validate_after_delay(token))
 
     async def _validate_after_delay(self, token: str):
-        """Wait, then fetch token_overview and decide WATCH/REJECT."""
-        await asyncio.sleep(VALIDATION_DELAY_SEC)
+        await asyncio.sleep(config.VALIDATION_DELAY_SEC)
 
         if self.db.has_watch(token):
-            return  # Already watched (race condition guard)
+            return
 
-        # Capacity check - don't accumulate too many watches
         if self.db.count_active_watches() >= config.MAX_WATCH_TOKENS:
             self.db.add_reject(token, "Watch list full")
             return
 
-        overview = await self.rest.token_overview(token)
+        overview = await self.dex.token_overview(token, self._pools.get(token))
         if not overview:
-            self.db.add_reject(token, "No overview from REST")
-            log.info("NO_OVERVIEW %s (REST returned empty)", token[:10])
+            self.db.add_reject(token, "No overview from free DEX")
+            log.info("NO_OVERVIEW %s", token[:10])
             return
 
         metrics = extract_metrics(overview)
-        log.info("VALIDATED %s liq=$%.0f vol5m=$%.0f txns5m=%d accel=%.2f",
-                 token[:10], metrics["liquidity_usd"], metrics["volume_5m_usd"],
-                 metrics["txns_5m"], metrics["volume_acceleration"])
+        # Keep display fields from overview
+        metrics["name"] = overview.get("name") or metrics.get("name") or ""
+        metrics["symbol"] = overview.get("symbol") or metrics.get("symbol") or ""
+        metrics["url"] = overview.get("url")
+
+        log.info(
+            "VALIDATED %s liq=$%.0f vol5m=$%.0f txns5m=%d accel=%.2f src=%s",
+            token[:10],
+            metrics["liquidity_usd"],
+            metrics["volume_5m_usd"],
+            metrics["txns_5m"],
+            metrics["volume_acceleration"],
+            overview.get("source"),
+        )
 
         passed, reason, score = apply_filters(metrics)
-
         if not passed:
             self.db.add_reject(token, reason, score)
             log.info("REJECT %s: %s", token[:10], reason)
             return
 
-        # Send Telegram first to capture message_id
         msg_id = await send_watch(self.session, token, metrics, score)
+        if msg_id is None:
+            self.db.add_reject(token, "Telegram send failed", score)
+            log.error("WATCH Telegram failed for %s", token[:10])
+            return
+
         if self.db.add_watch(token, score, metrics, msg_id):
             log.info("WATCH SENT %s score=%d msg_id=%s", token[:10], score, msg_id)
         else:
             log.warning("Could not record watch for %s", token[:10])
 
 
-async def expire_loop(db: Database):
-    """Periodically expire old watches."""
+async def discovery_loop(pipeline: Pipeline, stop_at: Optional[float]):
     while True:
+        if stop_at and time.time() >= stop_at:
+            log.info("RUN_DURATION reached — stopping discovery loop")
+            return
+        try:
+            listings = await pipeline.dex.fetch_new_listings()
+            log.info("Poll: %d new-pool candidates after filters", len(listings))
+            for listing in listings:
+                await pipeline.handle_listing(listing)
+        except Exception as e:
+            log.error("Discovery poll error: %s", e)
+        await asyncio.sleep(config.POLL_INTERVAL_SEC)
+
+
+async def expire_loop(db: Database, stop_at: Optional[float]):
+    while True:
+        if stop_at and time.time() >= stop_at:
+            return
         await asyncio.sleep(60)
         try:
             n = db.expire_old_watches(config.WATCH_TTL_MINUTES)
@@ -137,9 +147,10 @@ async def expire_loop(db: Database):
             log.error("Expire loop error: %s", e)
 
 
-async def stats_loop(db: Database):
-    """Log stats every 5 minutes."""
+async def stats_loop(db: Database, stop_at: Optional[float]):
     while True:
+        if stop_at and time.time() >= stop_at:
+            return
         await asyncio.sleep(300)
         try:
             s = db.stats()
@@ -153,28 +164,64 @@ async def stats_loop(db: Database):
 
 async def main():
     config.validate_config()
+    stop_at = (
+        time.time() + config.RUN_DURATION_SECONDS
+        if config.RUN_DURATION_SECONDS > 0
+        else None
+    )
+
     log.info("=" * 60)
-    log.info("Solana Momentum Bot - Phase 1 MVP")
-    log.info("Filter: min_liq=$%d meme=%s",
-             config.NEW_LISTING_FILTER["min_liquidity"],
-             config.NEW_LISTING_FILTER.get("meme_platform_enabled", False))
+    log.info("Solana Momentum Bot - Phase 1 (free DEX)")
+    log.info(
+        "Discovery=GeckoTerminal new_pools | Validation=DexScreener"
+    )
+    log.info(
+        "Filter: min_liq=$%d meme_dex_only=%s poll=%ss delay=%ss",
+        config.NEW_LISTING_FILTER["min_liquidity"],
+        config.NEW_LISTING_FILTER.get("meme_dex_only", False),
+        config.POLL_INTERVAL_SEC,
+        config.VALIDATION_DELAY_SEC,
+    )
+    if stop_at:
+        log.info("Timed run: %ss", config.RUN_DURATION_SECONDS)
     log.info("=" * 60)
 
     db = Database(config.DB_PATH)
 
-    async with aiohttp.ClientSession(headers={"User-Agent": "MomentumBot/2.0"}) as session:
-        rest = BirdeyeREST(session, config.BIRDEYE_API_KEY)
-        pipeline = Pipeline(db, rest, session)
+    headers = {
+        "User-Agent": "MomentumBot/2.0 (+https://github.com/momentum-bot)",
+        "Accept": "application/json",
+    }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        ok = await verify_telegram(session)
+        if not ok:
+            raise RuntimeError("Telegram verification failed — check TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
 
-        ws = BirdeyeWebSocket(config.BIRDEYE_API_KEY, pipeline.handle_new_listing)
-        ws.queue_subscription(build_new_listing_subscription(config.NEW_LISTING_FILTER))
+        if config.TELEGRAM_STARTUP_PING:
+            ping_id = await send_startup_ping(session)
+            if ping_id:
+                log.info("Startup ping sent (msg_id=%s)", ping_id)
+            else:
+                log.warning("Startup ping failed (bot will continue)")
 
-        # Run WebSocket + background loops concurrently
-        await asyncio.gather(
-            ws.run_forever(),
-            expire_loop(db),
-            stats_loop(db),
-        )
+        dex = DexClient(session)
+        pipeline = Pipeline(db, dex, session)
+
+        tasks = [
+            asyncio.create_task(discovery_loop(pipeline, stop_at)),
+            asyncio.create_task(expire_loop(db, stop_at)),
+            asyncio.create_task(stats_loop(db, stop_at)),
+        ]
+
+        if stop_at:
+            # Wait until duration ends, then cancel background loops
+            await asyncio.sleep(max(0, stop_at - time.time()))
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            log.info("Timed run complete")
+        else:
+            await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

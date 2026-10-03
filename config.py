@@ -1,17 +1,14 @@
 """
-Configuration - Phase 1 MVP.
+Configuration - Phase 1 MVP (free DEX sources).
 
 Phase 1 covers:
-- WebSocket SUBSCRIBE_TOKEN_NEW_LISTING (discovery)
-- REST token_overview (validation)
+- GeckoTerminal new_pools polling (discovery)
+- DexScreener / GeckoTerminal snapshots (validation)
 - Scoring + WATCH alert
 - SQLite persistence
 - Telegram notifications
 
-Phase 2 (later) will add:
-- SUBSCRIBE_TXS for rolling 5m metrics
-- Confirmation logic for ENTRY
-- Entry alert as reply to WATCH
+No Birdeye / paid API keys required for market data.
 """
 
 import os
@@ -20,26 +17,39 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==================== Credentials ====================
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# ==================== Birdeye Endpoints ====================
-BIRDEYE_REST_BASE = "https://public-api.birdeye.so"
-BIRDEYE_WS_URL = "wss://public-api.birdeye.so/socket/solana"
+# ==================== Free DEX Endpoints ====================
+GECKO_API_BASE = "https://api.geckoterminal.com/api/v2"
+DEXSCREENER_API_BASE = "https://api.dexscreener.com"
 CHAIN = "solana"
 
-ENDPOINT_TOKEN_OVERVIEW = "/defi/token_overview"
-
-# ==================== WebSocket Subscription Filter ====================
-# Pre-filter applied at the source - reduces noise before it reaches us
+# ==================== Discovery Filter ====================
+# Applied when polling GeckoTerminal new_pools
 NEW_LISTING_FILTER = {
-    "meme_platform_enabled": True,
-    "min_liquidity": 8000,  # idea #7 - hardcoded floor at the subscription level
-    # Optional: limit to specific sources to cut noise further
-    # "sources": ["pump_dot_fun", "raydium", "meteora_dynamic_bonding_curve"],
+    "min_liquidity": 8000,
+    # Focus on memecoin launch venues (GeckoTerminal dex ids)
+    "meme_dex_only": True,
+    "allowed_dexes": [
+        "pump-fun",
+        "pumpswap",
+        "raydium",
+        "raydium-launchlab",
+        "meteora",
+        "meteora-dbc",
+        "meteora-dyn",
+        "orca",
+    ],
 }
+
+# Polling
+POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "30"))
+# If set (e.g. GitHub Actions), stop after N seconds
+RUN_DURATION_SECONDS = int(os.getenv("RUN_DURATION_SECONDS", "0") or "0")
+# How long to wait after discovery before validation snapshot
+VALIDATION_DELAY_SEC = int(os.getenv("VALIDATION_DELAY_SEC", "90"))
 
 # ==================== Storage ====================
 DB_PATH = "momentum_bot.db"
@@ -55,9 +65,7 @@ SAFETY_FILTERS = {
     "max_age_seconds": 6 * 60 * 60,
 }
 
-# ==================== Momentum Filters (Phase 1 - based on REST snapshot) ====================
-# Note: in Phase 1 we work with token_overview's m5/h1 data - which is delayed.
-# Phase 2 will replace this with our own rolling window from TXS stream.
+# ==================== Momentum Filters ====================
 MOMENTUM_FILTERS = {
     "min_volume_5m_usd": 2500,
     "min_txns_5m": 25,
@@ -71,18 +79,20 @@ MOMENTUM_FILTERS = {
 }
 
 # ==================== Watch List Limits ====================
-# Per the plan: don't track too many at once
 MAX_WATCH_TOKENS = 50
 WATCH_TTL_MINUTES = 20
 
 # ==================== Telegram ====================
 PAPER_MODE_TEXT = "Phase 1: WATCH only - manual review required."
+TELEGRAM_STARTUP_PING = os.getenv("TELEGRAM_STARTUP_PING", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # ==================== Validation ====================
 def validate_config():
     missing = []
-    if not BIRDEYE_API_KEY:
-        missing.append("BIRDEYE_API_KEY")
     if not TELEGRAM_TOKEN:
         missing.append("TELEGRAM_TOKEN")
     if not TELEGRAM_CHAT_ID:
